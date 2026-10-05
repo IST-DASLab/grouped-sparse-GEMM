@@ -186,6 +186,35 @@ CUTLASS_DEVICE void fill_benign_sfb(ElementSF* sfb, int rows, int KB, int E, Cou
   }
 }
 
+// Gated activation of GEMM1's [gate | up] pair, applied before GEMM2's input quantization. Each
+// kind reproduces the rounding of the vLLM op it replaces, so fused and unfused paths stay
+// byte-identical to vLLM's activation followed by quant_act:
+//   kSilu  vLLM silu_and_mul:  bf16(bf16(silu_f32(g)) * u)
+//   kSitu  vLLM situ_and_mul (Kimi SiTU-GLU): bf16(gate_out * up_out) with
+//          gate_out = (0.5 beta) tanh(g / beta) (1 + tanh(g / 2))    [= beta tanh(g/beta) sigmoid(g)]
+//          up_out   = linear_beta > 0 ? linear_beta tanh(u / linear_beta) : u
+//          in fp32, one rounding at the end, with vLLM's operation order (inverse multiplies).
+struct GatedAct {
+  enum Kind : int { kSilu = 0, kSitu = 1 };
+  int kind = kSilu;
+  float beta = 1.f;          // kSitu gate softcap
+  float linear_beta = -1.f;  // kSitu up softcap; <= 0 leaves up unclipped
+};
+
+CUTLASS_DEVICE cutlass::bfloat16_t gated_act(cutlass::bfloat16_t gate, cutlass::bfloat16_t up,
+                                              GatedAct const& a) {
+  float const g = float(gate);
+  if (a.kind == GatedAct::kSitu) {
+    float const inv_beta = 1.0f / a.beta;
+    float const gate_out = (0.5f * a.beta) * tanhf(g * inv_beta) * (1.0f + tanhf(g * 0.5f));
+    float const u = float(up);
+    float const up_out = a.linear_beta > 0.0f ? a.linear_beta * tanhf(u * (1.0f / a.linear_beta)) : u;
+    return cutlass::bfloat16_t(gate_out * up_out);
+  }
+  cutlass::bfloat16_t const s_bf(g / (1.0f + expf(-g)));
+  return cutlass::bfloat16_t(float(s_bf) * float(up));
+}
+
 // Outputs and scales of the GEMM1 epilogue that fuses SwiGLU and GEMM2's input quantization
 // (sm100/swiglu_epilogue.cuh). Arch-aliased types only, so the shared op code can fill it.
 struct SwigluFp4Args {
@@ -201,6 +230,7 @@ struct SwigluFp4Args {
   int sfb_rows = 0;                    // SFB extents for the benign fill: cap, N / 32, E
   int sfb_kblocks = 0;
   int experts = 0;
+  GatedAct act{};                      // gated activation (SwiGLU or SiTU-GLU)
 };
 
 } // namespace paired_nvfp4

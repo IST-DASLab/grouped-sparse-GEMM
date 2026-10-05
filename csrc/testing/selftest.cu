@@ -805,7 +805,7 @@ torch::Tensor paired_nvfp4_selftest_silu_mul_quant(int64_t M_, int64_t maxn_, in
   auto qa_ref = paired_nvfp4_quant_act(a2, gscale, counts_t, M);
 
   // Fused op under test.
-  auto qa_fused = paired_nvfp4_silu_mul_quant_act(x2, gscale, counts_t, M);
+  auto qa_fused = paired_nvfp4_silu_mul_quant_act(x2, gscale, counts_t, M, false, "silu", 1.0, -1.0);
 
   torch::Tensor b_ref    = std::get<0>(qa_ref).to(torch::kCPU).contiguous();
   torch::Tensor sfb_ref  = std::get<1>(qa_ref).to(torch::kCPU).contiguous();

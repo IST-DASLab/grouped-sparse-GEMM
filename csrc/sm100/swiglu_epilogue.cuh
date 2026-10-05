@@ -203,10 +203,9 @@ class SwigluFp4Epilogue : public Base {
         for (int jj = 0; jj < kCols / 2; ++jj) {
           int const c = cbeg + jj;
           if (c >= valid) break;
-          float const gf = float(xbuf[((2 * blk) * kCols + c) * 32 + fl]);
+          cutlass::bfloat16_t const gate = xbuf[((2 * blk) * kCols + c) * 32 + fl];
           cutlass::bfloat16_t const up = xbuf[((2 * blk + 1) * kCols + c) * 32 + fl];
-          cutlass::bfloat16_t const s_bf(gf / (1.0f + expf(-gf)));
-          vbuf[(blk * kCols + c) * 32 + fl] = cutlass::bfloat16_t(float(s_bf) * float(up));
+          vbuf[(blk * kCols + c) * 32 + fl] = gated_act(gate, up, fused_.act);
         }
       }
       sync();

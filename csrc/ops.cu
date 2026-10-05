@@ -124,6 +124,22 @@ torch::Tensor benign_sfb(int64_t numel, torch::Device device) {
                      torch::TensorOptions().dtype(torch::kUInt8).device(device));
 }
 
+// The gated activation named by an op's (activation, beta, linear_beta) arguments.
+GatedAct make_gated_act(std::string const& activation, double beta, double linear_beta) {
+  GatedAct a;
+  if (activation == "silu") {
+    a.kind = GatedAct::kSilu;
+  } else if (activation == "situ") {
+    TORCH_CHECK(beta > 0, "situ: beta must be positive, got ", beta);
+    a.kind = GatedAct::kSitu;
+    a.beta = float(beta);
+    a.linear_beta = float(linear_beta);
+  } else {
+    TORCH_CHECK(false, "activation must be 'silu' or 'situ', got '", activation, "'");
+  }
+  return a;
+}
+
 // SFB output of a producer that writes the benign fill itself (fill_benign_sfb): no fill kernel.
 torch::Tensor kernel_filled_sfb(int64_t numel, torch::Device device) {
   return torch::empty({numel}, torch::TensorOptions().dtype(torch::kUInt8).device(device));
@@ -252,7 +268,8 @@ paired_nvfp4_quant_act(torch::Tensor x, torch::Tensor gscale, torch::Tensor expe
 
 std::tuple<torch::Tensor, torch::Tensor>
 paired_nvfp4_silu_mul_quant_act(torch::Tensor x2, torch::Tensor gscale,
-                                torch::Tensor expert_num_tokens, int64_t features, bool interleaved) {
+                                torch::Tensor expert_num_tokens, int64_t features, bool interleaved,
+                                std::string activation, double beta, double linear_beta) {
 #if PAIRED_NVFP4_ENABLED
   TORCH_CHECK(x2.is_cuda() && gscale.is_cuda() && expert_num_tokens.is_cuda(), "inputs must be CUDA");
   check_arch(x2);
@@ -280,7 +297,8 @@ paired_nvfp4_silu_mul_quant_act(torch::Tensor x2, torch::Tensor gscale,
                  Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_sparse_shape(M, max_n, N, E)),
                  cutlass::make_cute_packed_stride(StrideB{}, {max_n, N, E}),
                  gscale.data_ptr<float>(), expert_num_tokens.data_ptr<int32_t>(),
-                 max_n, N, E, gpe, device_info(x2.device().index()).sm_count, stream, interleaved ? 1 : 0);
+                 max_n, N, E, gpe, device_info(x2.device().index()).sm_count, stream, interleaved ? 1 : 0,
+                 make_gated_act(activation, beta, linear_beta));
   return {b_act, sfb};
 #else
   TORCH_CHECK(false, "paired_nvfp4 was built without SM", kArchSm, " support");
@@ -575,7 +593,8 @@ paired_nvfp4_group_mm_swiglu_quant(torch::Tensor A_comp, torch::Tensor E_meta, t
                                    torch::Tensor B_act, torch::Tensor SFB, torch::Tensor alphas,
                                    torch::Tensor expert_num_tokens, torch::Tensor gscale,
                                    int64_t features, int64_t k, int64_t config_id,
-                                   int64_t cluster_m, int64_t cluster_n) {
+                                   int64_t cluster_m, int64_t cluster_n, std::string activation,
+                                   double beta, double linear_beta) {
 #if PAIRED_NVFP4_ENABLED
   TORCH_CHECK(kNumSwigluMmKinds > 0, "group_mm_swiglu_quant is not available on SM", kArchSm);
   TORCH_CHECK(A_comp.is_cuda() && E_meta.is_cuda() && SFA.is_cuda() && B_act.is_cuda() &&
@@ -627,6 +646,7 @@ paired_nvfp4_group_mm_swiglu_quant(torch::Tensor A_comp, torch::Tensor E_meta, t
   fused.sfb_rows = max_n;
   fused.sfb_kblocks = N / SFVecSize;
   fused.experts = E;
+  fused.act = make_gated_act(activation, beta, linear_beta);
 
   GroupMmParams params{b_out, A_comp, E_meta, SFA, B_act, SFB, alphas, expert_num_tokens,
                        M, K, cm, cn, device_info(B_act.device().index()).sm_count, /*splits=*/1};
@@ -721,8 +741,8 @@ TORCH_LIBRARY(paired_nvfp4, m) {
   m.def("quant_act(Tensor x, Tensor gscale, Tensor expert_num_tokens, int features) "
         "-> (Tensor, Tensor)");
   m.def("silu_mul_quant_act(Tensor x2, Tensor gscale, Tensor expert_num_tokens, int features, "
-        "bool interleaved=False) "
-        "-> (Tensor, Tensor)");
+        "bool interleaved=False, str activation=\"silu\", float beta=1.0, "
+        "float linear_beta=-1.0) -> (Tensor, Tensor)");
   m.def("scatter_quant_act(Tensor a1, Tensor flat_tok, Tensor dest_global, "
         "Tensor? topk_weights, Tensor gscale, Tensor expert_num_tokens, int cap) "
         "-> (Tensor, Tensor)");
@@ -747,7 +767,8 @@ TORCH_LIBRARY(paired_nvfp4, m) {
         "Tensor sfb, Tensor alphas, Tensor expert_num_tokens, Tensor gscale, int features, "
         "int k, int config_id=0, "
         "int cluster_m=" PAIRED_NVFP4_STR(PAIRED_NVFP4_DEFAULT_CLUSTER_M) ", "
-        "int cluster_n=" PAIRED_NVFP4_STR(PAIRED_NVFP4_DEFAULT_CLUSTER_N) ") -> (Tensor, Tensor)");
+        "int cluster_n=" PAIRED_NVFP4_STR(PAIRED_NVFP4_DEFAULT_CLUSTER_N) ", "
+        "str activation=\"silu\", float beta=1.0, float linear_beta=-1.0) -> (Tensor, Tensor)");
   m.def("group_mm_swiglu_configs() -> str[]");
 }
 
