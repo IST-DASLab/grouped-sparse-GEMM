@@ -96,7 +96,7 @@ capacity. All tensors are CUDA and contiguous.
 |---|---|---|---|
 | `compress(w_packed, w_blockscale, k)` | load | `uint8 [E,M,K/2]`, `uint8 [E,M,K/32]` | `a_comp`, `e_meta` (uint8, kernel layouts), `sfa` (uint8, swizzled) |
 | `quant_act(x, gscale, expert_num_tokens, features)` | forward | `bf16 [E,max_n,K]`, `f32 [E]` or `[1]`, `i32 [E]` | `b_act uint8 [E,max_n,K/2]`, `sfb uint8` (swizzled) |
-| `silu_mul_quant_act(x2, gscale, expert_num_tokens, features)` | forward | `bf16 [E,max_n,2N]` = `[gate \| up]` | `b_act uint8 [E,max_n,N/2]`, `sfb` |
+| `silu_mul_quant_act(x2, gscale, expert_num_tokens, features, interleaved=False, activation="silu", beta=1.0, linear_beta=-1.0)` | forward | `bf16 [E,max_n,2N]` = `[gate \| up]` | `b_act uint8 [E,max_n,N/2]`, `sfb` |
 | `scatter_quant_act(a1, flat_tok, dest_global, topk_weights, gscale, expert_num_tokens, cap)` | forward | token-order `bf16 [T,K]` + dispatch plan (`i64 [T*topk]` each), optional `f32 [T*topk]` | `b_act uint8 [E,cap,K/2]`, `sfb` |
 | `dispatch_plan(topk_ids, first_expert, num_local_experts, cap)` | forward | `i32`/`i64 [T,topk]` global expert ids; this rank owns `[first_expert, first_expert+E)` | `expert_num_tokens i32 [E]`, `route_dest i32 [T,topk]`, `src_tok i32 [E*cap]`, `src_route i32 [E*cap]` |
 | `scatter_quant_act_planned(a1, src_tok, src_route, topk_weights, gscale, expert_num_tokens, cap)` | forward | token-order `bf16 [T,K]` + the plan, optional `f32 [T*topk]` | `b_act uint8 [E,cap,K/2]`, `sfb` |
@@ -118,7 +118,10 @@ Contracts worth knowing:
   `b_act = e2m1(x * gscale[e] / sfb)`. Quantizing against the rounded stored scale leaves pure
   e2m1 rounding error.
 - **`silu_mul_quant_act` is bit-exact** with `silu_and_mul` (bf16 rounding chain as in vLLM)
-  followed by `quant_act`. **`scatter_quant_act`** fuses the dispatch gather/scatter with
+  followed by `quant_act`; with `activation="situ"` (Kimi's SiTU-GLU,
+  `beta·tanh(g/beta)·sigmoid(g) · linear_beta·tanh(up/linear_beta)`, the up softcap off for
+  `linear_beta <= 0`) it is bit-exact with vLLM's `situ_and_mul` instead. `group_mm_swiglu_quant`
+  takes the same `activation, beta, linear_beta` arguments. **`scatter_quant_act`** fuses the dispatch gather/scatter with
   quantization: `dest_global[i]` is `e*cap + r`, or `E*cap` to drop a routing (non-local expert
   or over capacity); `topk_weights` applies the router weight on the input.
 - **Dispatch and combine.** `dispatch_plan` gives each kept routing the row

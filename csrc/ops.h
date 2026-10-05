@@ -55,7 +55,8 @@ paired_nvfp4_quant_act(torch::Tensor x, torch::Tensor gscale, torch::Tensor expe
 
 std::tuple<torch::Tensor, torch::Tensor>
 paired_nvfp4_silu_mul_quant_act(torch::Tensor x2, torch::Tensor gscale,
-                                torch::Tensor expert_num_tokens, int64_t features, bool interleaved = false);
+                                torch::Tensor expert_num_tokens, int64_t features, bool interleaved,
+                                std::string activation, double beta, double linear_beta);
 
 std::tuple<torch::Tensor, torch::Tensor>
 paired_nvfp4_scatter_quant_act(torch::Tensor a1, torch::Tensor flat_tok,

@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+SiTU-GLU (Kimi-K3's activation) in the gated-activation quantizer and the fused GEMM1 epilogue.
+- `silu_mul_quant_act` and `group_mm_swiglu_quant` take `activation="silu" | "situ"`, `beta` and
+  `linear_beta` (defaults: SwiGLU, unchanged). SiTU computes
+  `(0.5 beta) tanh(g / beta) (1 + tanh(g / 2)) * (linear_beta tanh(up / linear_beta))` in fp32 with
+  one bf16 rounding, the operation order of vLLM's `situ_and_mul`, so both paths stay
+  byte-identical to vLLM's activation followed by `quant_act`. `linear_beta <= 0` leaves `up`
+  unclipped. One shared device helper (`gated_act`, `GatedAct` in `csrc/layout.cuh`) serves the
+  standalone kernel and both arches' fused epilogues.
+
 ## 0.13.0
 
 SM120 fused SwiGLU + FP4 GEMM1 epilogue, programmatic dependent launch (PDL) across the MoE chain,

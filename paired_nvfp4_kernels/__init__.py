@@ -16,8 +16,9 @@ Importing the package registers the ops on the torch dispatcher:
 
     torch.ops.paired_nvfp4.compress(w_packed, w_blockscale, k) -> (a_comp, e_meta, sfa)
     torch.ops.paired_nvfp4.quant_act(x, gscale, expert_num_tokens, features) -> (b_act, sfb)
-    torch.ops.paired_nvfp4.silu_mul_quant_act(x2, gscale, expert_num_tokens, features)
-        -> (b_act, sfb)
+    torch.ops.paired_nvfp4.silu_mul_quant_act(x2, gscale, expert_num_tokens, features,
+                                              interleaved=False, activation="silu", beta=1.0,
+                                              linear_beta=-1.0) -> (b_act, sfb)
     torch.ops.paired_nvfp4.scatter_quant_act(a1, flat_tok, dest_global, topk_weights, gscale,
                                              expert_num_tokens, cap) -> (b_act, sfb)
     torch.ops.paired_nvfp4.dispatch_plan(topk_ids, first_expert, num_local_experts, cap)

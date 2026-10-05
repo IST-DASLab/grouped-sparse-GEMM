@@ -294,7 +294,7 @@ __global__ void silu_mul_quant_kernel(cutlass::bfloat16_t const* __restrict__ x2
                                       StrideB stride_B, float const* __restrict__ gscale,
                                       int const* __restrict__ counts,
                                       int max_n, int N, int E, int gscale_per_expert,
-                                      int interleaved) {
+                                      int interleaved, GatedAct act) {
   int KB = N / SFVecSize;
   int kb = int(blockIdx.x) * int(blockDim.x) + int(threadIdx.x);
   int k0 = kb * SFVecSize;
@@ -322,11 +322,7 @@ __global__ void silu_mul_quant_kernel(cutlass::bfloat16_t const* __restrict__ x2
 
     cutlass::bfloat16_t vals[SFVecSize];
     CUTLASS_PRAGMA_UNROLL
-    for (int j = 0; j < SFVecSize; ++j) {
-      float gf = float(gate[j]);
-      cutlass::bfloat16_t s_bf(gf / (1.0f + expf(-gf)));
-      vals[j] = cutlass::bfloat16_t(float(s_bf) * float(up[j]));
-    }
+    for (int j = 0; j < SFVecSize; ++j) vals[j] = gated_act(gate[j], up[j], act);
     ElementSF s;
     uint4 packed = quantize_block(vals, g, s);
     sf(t, k0, e) = s;
@@ -338,11 +334,12 @@ template <class LayoutSFB>
 inline void silu_mul_quant(cutlass::bfloat16_t const* x2, ElementB* b_act, ElementSF* sfb,
                            LayoutSFB layout_SFB, StrideB stride_B, float const* gscale,
                            int const* counts, int max_n, int N, int E, int gscale_per_expert,
-                           int sm_count, cudaStream_t stream, int interleaved = 0) {
+                           int sm_count, cudaStream_t stream, int interleaved = 0,
+                           GatedAct act = GatedAct{}) {
   QuantLaunch lc = quant_launch(N / SFVecSize, max_n, E, sm_count);
   pdl::launch(silu_mul_quant_kernel<LayoutSFB>, lc.grid, lc.block, quant_smem(E), stream,
               x2, b_act, sfb, layout_SFB, stride_B, gscale, counts, max_n, N, E, gscale_per_expert,
-              interleaved);
+              interleaved, act);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
