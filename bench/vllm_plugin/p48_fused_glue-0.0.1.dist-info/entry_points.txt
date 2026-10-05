@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+p48_fused_glue = p48_fused_glue:register

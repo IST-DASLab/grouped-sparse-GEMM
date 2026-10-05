@@ -1,0 +1,26 @@
+--- a/include/cutlass/gemm/collective/sm100_blockscaled_sparse_mma_warpspecialized.hpp
++++ b/include/cutlass/gemm/collective/sm100_blockscaled_sparse_mma_warpspecialized.hpp
+@@ -1,3 +1,11 @@
++/*
++ * Modified by Kwanhee Lee and Dan Alistarh for grouped-sparse-GEMM.
++ *   - Allow Cta N = 64. The collective already carries the IsCtaN64 scale-factor-B paths (the
++ *     same ones as the dense block-scaled collective, which accepts N = 64); stock CUTLASS v4.8.0
++ *     only excludes 64 in this static_assert.
++ * The change against stock CUTLASS v4.8.0 is patches/cutlass-v4.8.0-sm100-sparse-ctan64.patch.
++ */
++
+ /***************************************************************************************************
+  * Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: BSD-3-Clause
+@@ -126,8 +134,9 @@
+                        "Static cluster shape used: TileShape should be evenly divided by TiledMma");
+ 
+   using CtaShape_MNK = decltype(shape_div(TileShape{}, AtomThrShapeMNK{}));
+-  static_assert(shape<1>(CtaShape_MNK{}) == 192 or shape<1>(CtaShape_MNK{}) == 128 or shape<1>(CtaShape_MNK{}) == 256,
+-      "Cta N should be one of 128/192/256");
++  static_assert(shape<1>(CtaShape_MNK{}) == 192 or shape<1>(CtaShape_MNK{}) == 128 or
++                shape<1>(CtaShape_MNK{}) == 256 or shape<1>(CtaShape_MNK{}) == 64,
++      "Cta N should be one of 64/128/192/256");
+ 
+   using ClusterTileShape = decltype(make_shape(get<0>(TileShape{})*get<0>(ClusterShape{}),get<1>(TileShape{})*get<1>(ClusterShape{}),get<2>(TileShape{})*get<2>(ClusterShape{})));
+   using Sm1xxBlkScaledConfig = cutlass::detail::Sm1xxBlockScaledConfig<SFVecSize>;

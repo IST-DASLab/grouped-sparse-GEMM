@@ -1,0 +1,6 @@
+include README.md LICENSE NOTICE CHANGELOG.md pyproject.toml
+recursive-include csrc *.cu *.cuh *.h *.hpp
+recursive-include patches *.patch
+recursive-include third_party/cutlass/include *
+recursive-include third_party/cutlass/tools/util/include *
+include third_party/cutlass/LICENSE.txt

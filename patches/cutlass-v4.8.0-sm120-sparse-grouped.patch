@@ -1,0 +1,778 @@
+--- a/include/cutlass/gemm/kernel/sm120_gemm_tma_warpspecialized_cooperative_asymmetric_dma.hpp
++++ b/include/cutlass/gemm/kernel/sm120_gemm_tma_warpspecialized_cooperative_asymmetric_dma.hpp
+@@ -40,8 +40,10 @@
+ #include "cutlass/arch/mma_sm90.h"
+ #include "cutlass/epilogue/collective/detail.hpp"
+ #include "cutlass/gemm/gemm.h"
++#include "cutlass/gemm/group_array_problem_shape.hpp"
+ #include "cutlass/gemm/dispatch_policy.hpp"
+ #include "cutlass/gemm/kernel/tile_scheduler.hpp"
++#include "cutlass/gemm/kernel/sm120_tile_scheduler_group_splitk.hpp"
+ #include "cutlass/pipeline/pipeline.hpp"
+ #include "cute/tensor.hpp"
+ #include "cutlass/trace.h"
+@@ -52,6 +54,18 @@
+ 
+ namespace cutlass::gemm::kernel {
+ 
++#ifndef GROUPED_SPARSE_GEMM_HAS_PROLOGUE_FILL
++#define GROUPED_SPARSE_GEMM_HAS_PROLOGUE_FILL   // shared with the SM100 kernel override
++namespace detail {
++// grouped-sparse-GEMM: epilogues with a prologue_fill(tid, nthr) member (see its call below).
++template <class Epilogue, class = void>
++struct HasPrologueFill : cute::false_type {};
++template <class Epilogue>
++struct HasPrologueFill<Epilogue, cute::void_t<decltype(std::declval<Epilogue&>().prologue_fill(0, 1))>>
++    : cute::true_type {};
++} // namespace detail
++#endif
++
+ ///////////////////////////////////////////////////////////////////////////////
+ 
+ template <
+@@ -76,7 +90,22 @@
+   // Type Aliases
+   //
+   using ProblemShape = ProblemShape_;
+-  static_assert(cute::rank(ProblemShape{}) == 3 or cute::rank(ProblemShape{}) == 4,
++  static constexpr bool IsGroupedGemmKernel = cutlass::gemm::detail::is_moe_problem_shape<ProblemShape>::value;
++
++  // Shape every collective is set up with. Grouped: the max shape (M, max_n, K, groups), which
++  // addresses B / D / SFB at a fixed per-group stride exactly like kBatched with L = groups.
++  CUTLASS_HOST_DEVICE
++  static auto get_problem_shape_gemm(ProblemShape const& shape) {
++    if constexpr (IsGroupedGemmKernel) {
++      return cute::make_shape(shape.max_m, shape.max_n, shape.max_k, shape.groups());
++    }
++    else {
++      return shape;
++    }
++  }
++
++  using ProblemShapeGemm = decltype(get_problem_shape_gemm(ProblemShape{}));
++  static_assert(cute::rank(ProblemShapeGemm{}) == 3 or cute::rank(ProblemShapeGemm{}) == 4,
+     "ProblemShape{} should be <M,N,K> or <M,N,K,L>");
+ 
+   // Mainloop derived types
+@@ -106,12 +135,26 @@
+   static_assert(ArchTag::kMinComputeCapability >= 90);
+   static constexpr uint32_t TileSchedulerPipelineStageCount = DispatchPolicy::Schedule::SchedulerPipelineStageCount;
+ 
+-  using TileSchedulerTag = TileSchedulerTag_;
++  using TileSchedulerTag = cute::conditional_t<IsGroupedGemmKernel, cutlass::gemm::GroupScheduler, TileSchedulerTag_>;
+   using CtaShape_MNK = decltype(shape_div(TileShape{}, ClusterShape{}));
+-  using TileScheduler = typename detail::TileSchedulerSelector<
+-                          TileSchedulerTag, ArchTag, TileShape, ClusterShape
+-                          ,TileSchedulerPipelineStageCount
+-                          >::Scheduler;
++
++  template <bool Grouped, class SchedulerTag, class ProblemShapeType>
++  struct SparseTileSchedulerSelector {
++    using Scheduler = typename detail::TileSchedulerSelector<
++                        SchedulerTag, ArchTag, TileShape, ClusterShape
++                        ,TileSchedulerPipelineStageCount
++                        >::Scheduler;
++  };
++
++  // Grouped: the SM120 group scheduler with optional split-K (sm120_tile_scheduler_group_splitk.hpp;
++  // splits == 1 schedules exactly like PersistentTileSchedulerSm90Group).
++  template <class SchedulerTag, class ProblemShapeType>
++  struct SparseTileSchedulerSelector<true, SchedulerTag, ProblemShapeType> {
++    using Scheduler = detail::PersistentTileSchedulerSm120GroupSplitK<
++                        ProblemShapeType, TileSchedulerPipelineStageCount, TileShape>;
++  };
++
++  using TileScheduler = typename SparseTileSchedulerSelector<IsGroupedGemmKernel, TileSchedulerTag_, ProblemShape>::Scheduler;
+ 
+   using TileSchedulerArguments = typename TileScheduler::Arguments;
+   using TileSchedulerParams = typename TileScheduler::Params;
+@@ -151,7 +194,16 @@
+   using TileSchedulerPipelineState = typename TileSchedulerPipeline::PipelineState;
+   using TileSchedulerThrottlePipeline = typename TileScheduler::ThrottlePipeline;
+   using TileSchedulerThrottlePipelineState = typename TileSchedulerThrottlePipeline::PipelineState;
+-  using TileSchedulerStorage = typename TileScheduler::SharedStorage;
++  // The group scheduler's SharedStorage::pipeline() returns its barriers by value, so the grouped
++  // kernel keeps the scheduler pipeline and response buffer in storage of its own.
++  template <class Scheduler, class Pipeline>
++  struct GroupSchedulerStorage {
++    alignas(16) typename Pipeline::SharedStorage pipeline;
++    alignas(16) typename Scheduler::SchedulerResponse data[TileSchedulerPipelineStageCount];
++  };
++  using TileSchedulerStorage = cute::conditional_t<IsGroupedGemmKernel,
++    GroupSchedulerStorage<TileScheduler, TileSchedulerPipeline>,
++    typename TileScheduler::SharedStorage>;
+ 
+   // Kernel level shared memory storage
+   struct SharedStorage {
+@@ -194,6 +246,7 @@
+   struct Params {
+     GemmUniversalMode mode{};
+     ProblemShape problem_shape{};
++    ProblemShapeGemm problem_shape_gemm{};
+     MainloopParams mainloop{};
+     EpilogueParams epilogue{};
+     KernelHardwareInfo hw_info{};
+@@ -211,11 +264,13 @@
+   to_underlying_arguments(Arguments const& args, void* workspace) {
+     CUTLASS_TRACE_HOST("to_underlying_arguments():");
+ 
+-    auto problem_shape = args.problem_shape;
++    auto problem_shape_gemm = get_problem_shape_gemm(args.problem_shape);
++    auto problem_shape = problem_shape_gemm;
+     if constexpr (detail::Has_SwapAB_v<CollectiveMainloop>) {
++      static_assert(!IsGroupedGemmKernel, "grouped mode does not support swapped A/B");
+       // swap M/N
+-      get<0>(problem_shape) = get<1>(args.problem_shape);
+-      get<1>(problem_shape) = get<0>(args.problem_shape);
++      get<0>(problem_shape) = get<1>(problem_shape_gemm);
++      get<1>(problem_shape) = get<0>(problem_shape_gemm);
+     }
+     auto problem_shape_MNKL = append<4>(problem_shape, 1);
+ 
+@@ -237,7 +292,7 @@
+     size_t workspace_offset = 0;
+ 
+     void* epilogue_workspace = workspace_ptr + workspace_offset;
+-    workspace_offset += CollectiveEpilogue::get_workspace_size(args.problem_shape, args.epilogue);
++    workspace_offset += CollectiveEpilogue::get_workspace_size(problem_shape_gemm, args.epilogue);
+     workspace_offset = round_nearest(workspace_offset,  MinWorkspaceAlignment);
+ 
+     void* mainloop_workspace = nullptr;
+@@ -251,15 +306,26 @@
+     // in separate reduction scheme for streamk case, NumEpilogueSubTiles default value is 1, which means
+     // subtile will not be used, therefore separate reduction will not be enabled.
+     constexpr uint32_t NumEpilogueSubTiles = CollectiveEpilogue::get_store_pipe_increment(TileShape{});
+-    TileSchedulerParams scheduler = TileScheduler::to_underlying_arguments(
+-      problem_shape_MNKL, TileShape{}, ClusterShape{}, hw_info, args.scheduler, scheduler_workspace, NumEpilogueSubTiles
+-      );
++    TileSchedulerParams scheduler = [&]() {
++      if constexpr (IsGroupedGemmKernel) {
++        // The group scheduler reads each group's N from the device-side token counts.
++        return TileScheduler::to_underlying_arguments(
++          args.problem_shape, TileShape{}, ClusterShape{}, hw_info, args.scheduler, scheduler_workspace, NumEpilogueSubTiles
++          );
++      }
++      else {
++        return TileScheduler::to_underlying_arguments(
++          problem_shape_MNKL, TileShape{}, ClusterShape{}, hw_info, args.scheduler, scheduler_workspace, NumEpilogueSubTiles
++          );
++      }
++    }();
+ 
+     return {
+       args.mode,
++      args.problem_shape,
+       problem_shape,
+-      CollectiveMainloop::to_underlying_arguments(args.problem_shape, args.mainloop, mainloop_workspace),
+-      CollectiveEpilogue::to_underlying_arguments(args.problem_shape, args.epilogue, epilogue_workspace),
++      CollectiveMainloop::to_underlying_arguments(problem_shape_gemm, args.mainloop, mainloop_workspace),
++      CollectiveEpilogue::to_underlying_arguments(problem_shape_gemm, args.epilogue, epilogue_workspace),
+       hw_info,
+       scheduler,
+       workspace
+@@ -268,14 +334,23 @@
+ 
+   static bool
+   can_implement(Arguments const& args) {
+-    bool implementable = (args.mode == GemmUniversalMode::kGemm) or
+-        (args.mode == GemmUniversalMode::kBatched && cute::rank(ProblemShape{}) == 4);
++    bool implementable = true;
++    if constexpr (IsGroupedGemmKernel) {
++      implementable &= args.mode == GemmUniversalMode::kGrouped;
++      implementable &= args.problem_shape.groups() > 0;
++      implementable &= args.problem_shape.tokens_per_expert != nullptr;
++    }
++    else {
++      implementable &= (args.mode == GemmUniversalMode::kGemm) or
++          (args.mode == GemmUniversalMode::kBatched && cute::rank(ProblemShape{}) == 4);
++    }
+     if (!implementable) {
+       CUTLASS_TRACE_HOST("  CAN IMPLEMENT: Arguments or Problem Shape don't meet the requirements.\n");
+       return implementable;
+     }
+-    implementable &= CollectiveMainloop::can_implement(args.problem_shape, args.mainloop);
+-    implementable &= CollectiveEpilogue::can_implement(args.problem_shape, args.epilogue);
++    auto problem_shape_gemm = get_problem_shape_gemm(args.problem_shape);
++    implementable &= CollectiveMainloop::can_implement(problem_shape_gemm, args.mainloop);
++    implementable &= CollectiveEpilogue::can_implement(problem_shape_gemm, args.epilogue);
+     implementable &= TileScheduler::can_implement(args.scheduler, args.hw_info);
+     return implementable;
+   }
+@@ -285,7 +360,7 @@
+     size_t workspace_size = 0;
+     constexpr uint32_t NumEpilogueSubTiles = CollectiveEpilogue::get_store_pipe_increment(TileShape{});
+ 
+-    workspace_size += CollectiveEpilogue::get_workspace_size(args.problem_shape, args.epilogue);
++    workspace_size += CollectiveEpilogue::get_workspace_size(get_problem_shape_gemm(args.problem_shape), args.epilogue);
+     workspace_size = round_nearest(workspace_size,  MinWorkspaceAlignment);
+ 
+     workspace_size += TileScheduler::template get_workspace_size<ProblemShape, ElementAccumulator>(
+@@ -304,8 +379,9 @@
+     constexpr uint32_t NumEpilogueSubTiles = CollectiveEpilogue::get_store_pipe_increment(TileShape{});
+     static constexpr uint32_t NumAccumulatorMtxs = 1;
+ 
+-    status = CollectiveEpilogue::initialize_workspace(args.problem_shape, args.epilogue, workspace_ptr + workspace_offset, stream, cuda_adapter);
+-    workspace_offset += CollectiveEpilogue::get_workspace_size(args.problem_shape, args.epilogue);
++    auto problem_shape_gemm = get_problem_shape_gemm(args.problem_shape);
++    status = CollectiveEpilogue::initialize_workspace(problem_shape_gemm, args.epilogue, workspace_ptr + workspace_offset, stream, cuda_adapter);
++    workspace_offset += CollectiveEpilogue::get_workspace_size(problem_shape_gemm, args.epilogue);
+     workspace_offset = round_nearest(workspace_offset,  MinWorkspaceAlignment);
+     if (status != Status::kSuccess) {
+       return status;
+@@ -328,11 +404,19 @@
+   get_grid_shape(Params const& params) {
+     // Given device SM count, set grid size s.t. we do not launch more thread blocks than we can run concurrently
+     TileSchedulerArguments args{};
+-    if constexpr (!std::is_const_v<decltype(args.max_swizzle_size)>) {
++    if constexpr (IsGroupedGemmKernel) {
++      args.max_swizzle_size = params.scheduler.max_swizzle_size_;
++    }
++    else if constexpr (!std::is_const_v<decltype(args.max_swizzle_size)>) {
+       args.max_swizzle_size = 1 << params.scheduler.log_swizzle_size_;
+     }
+     args.raster_order = params.scheduler.raster_order_ == TileScheduler::RasterOrder::AlongN ? TileScheduler::RasterOrderOptions::AlongN : TileScheduler::RasterOrderOptions::AlongM;
+-    return TileScheduler::get_grid_shape(params.scheduler, params.problem_shape, TileShape{}, ClusterShape{}, params.hw_info, args);
++    if constexpr (IsGroupedGemmKernel) {
++      return TileScheduler::get_grid_shape(params.scheduler, params.problem_shape, TileShape{}, ClusterShape{}, params.hw_info, args);
++    }
++    else {
++      return TileScheduler::get_grid_shape(params.scheduler, params.problem_shape_gemm, TileShape{}, ClusterShape{}, params.hw_info, args);
++    }
+   }
+ 
+   static dim3
+@@ -426,10 +510,40 @@
+             TileSchedulerThrottlePipeline::ThreadCategory::Producer;
+       }
+     }
+-    TileSchedulerPipeline scheduler_pipeline(shared_storage.scheduler.pipeline(), scheduler_pipeline_params, ClusterShape{});
++    else if constexpr (IsGroupedGemmKernel) {
++      // Warp1 walks the groups and publishes each next work tile; every warp that runs the work
++      // loop (the two mainloop load warps, the MMA warps and, if used, the epilogue load warp)
++      // consumes each published tile once.
++      if (warp_group_role == WarpGroupRole::Producer && producer_warp_role == ProducerWarpRole::Warp1) {
++        scheduler_pipeline_params.role = TileSchedulerPipeline::ThreadCategory::Producer;
++      }
++      else {
++        scheduler_pipeline_params.role = TileSchedulerPipeline::ThreadCategory::Consumer;
++      }
++      scheduler_pipeline_params.producer_arv_count = 1;
++      scheduler_pipeline_params.consumer_arv_count = NumMainloopLoadThreads + NumMMAThreads;
++      if (is_epi_load_needed) {
++        scheduler_pipeline_params.consumer_arv_count += NumEpilogueLoadThreads;
++      }
++    }
++    TileSchedulerPipeline scheduler_pipeline = [&]() {
++      if constexpr (IsGroupedGemmKernel) {
++        return TileSchedulerPipeline(shared_storage.scheduler.pipeline, scheduler_pipeline_params);
++      }
++      else {
++        return TileSchedulerPipeline(shared_storage.scheduler.pipeline(), scheduler_pipeline_params, ClusterShape{});
++      }
++    }();
+     TileSchedulerPipelineState scheduler_pipe_consumer_state;
+ 
+-    TileSchedulerThrottlePipeline scheduler_throttle_pipeline(shared_storage.scheduler.throttle_pipeline(), scheduler_throttle_pipeline_params);
++    TileSchedulerThrottlePipeline scheduler_throttle_pipeline = [&]() {
++      if constexpr (IsGroupedGemmKernel) {
++        return TileSchedulerThrottlePipeline(typename TileSchedulerThrottlePipeline::SharedStorage{}, scheduler_throttle_pipeline_params);
++      }
++      else {
++        return TileSchedulerThrottlePipeline(shared_storage.scheduler.throttle_pipeline(), scheduler_throttle_pipeline_params);
++      }
++    }();
+     TileSchedulerThrottlePipelineState scheduler_pipe_throttle_consumer_state;
+     TileSchedulerThrottlePipelineState scheduler_pipe_throttle_producer_state = cutlass::make_producer_start_state<TileSchedulerThrottlePipeline>();
+ 
+@@ -516,13 +630,20 @@
+     } ();
+ 
+     // Optionally append 1s until problem shape is rank-4 in case it is only rank-3 (MNK)
+-    auto problem_shape_MNKL = append<4>(params.problem_shape, Int<1>{});
++    auto problem_shape_MNKL = append<4>(params.problem_shape_gemm, Int<1>{});
+ 
+     // Get the appropriate blocks for this thread block -- potential for thread block locality
+     TiledMma tiled_mma;
+     auto blk_shape = TileShape{};                                                                // (BLK_M,BLK_N,BLK_K)
+ 
+-    TileScheduler scheduler{params.scheduler};
++    TileScheduler scheduler = [&]() {
++      if constexpr (IsGroupedGemmKernel) {
++        return TileScheduler{params.scheduler, shared_storage.scheduler.data};
++      }
++      else {
++        return TileScheduler{params.scheduler};
++      }
++    }();
+     if constexpr (IsSchedDynamicPersistent) {
+       scheduler.set_data_ptr(shared_storage.scheduler.data());
+     }
+@@ -582,6 +703,26 @@
+           }
+           scheduler_pipeline.producer_tail(scheduler_pipe_producer_state);
+         }
++        else if constexpr (IsGroupedGemmKernel) {
++          // Every warp computes its first tile itself; publish the rest, ending with the first
++          // invalid tile, which tells each consumer to exit. A CTA with no valid first tile
++          // publishes nothing (no consumer would ever release it).
++          TileSchedulerPipelineState scheduler_pipe_producer_state = cutlass::make_producer_start_state<TileSchedulerPipeline>();
++
++          cutlass::arch::wait_on_dependent_grids();
++
++          while (work_tile_info.is_valid()) {
++            auto [next_work_tile_info, increment_pipe] = scheduler.advance_to_next_work(
++              scheduler_pipeline,
++              scheduler_pipe_producer_state
++            );
++            work_tile_info = next_work_tile_info;
++            if (increment_pipe) {
++              ++scheduler_pipe_producer_state;
++            }
++          }
++          scheduler_pipeline.producer_tail(scheduler_pipe_producer_state);
++        }
+       } // Scheduler Producer Warp End
+       else
+       // Producer Warp to LoadMK
+@@ -594,10 +735,12 @@
+         bool do_load_order_arrive = true;
+         bool requires_clc_query = true;
+         while (work_tile_info.is_valid()) {
+-          if (!TileScheduler::valid_warpgroup_in_work_tile(work_tile_info)) {
+-            auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(work_tile_info);
+-            work_tile_info = next_work_tile_info;
+-            continue;
++          if constexpr (!IsGroupedGemmKernel) {   // group scheduler tiles are valid for every warp group
++            if (!TileScheduler::valid_warpgroup_in_work_tile(work_tile_info)) {
++              auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(work_tile_info);
++              work_tile_info = next_work_tile_info;
++              continue;
++            }
+           }
+ 
+           // Compute m_coord, n_coord, l_coord with the post-tiled m-shape and n-shape
+@@ -644,6 +787,8 @@
+           work_tile_info = next_work_tile_info;
+           if constexpr (IsSchedDynamicPersistent) {
+             requires_clc_query = increment_pipe;
++          }
++          if constexpr (IsSchedDynamicPersistent || IsGroupedGemmKernel) {
+             if (increment_pipe) {
+               ++scheduler_pipe_consumer_state;
+             }
+@@ -666,10 +811,12 @@
+         bool do_load_order_arrive = true;
+         bool requires_clc_query = true;
+         while (work_tile_info.is_valid()) {
+-          if (!TileScheduler::valid_warpgroup_in_work_tile(work_tile_info)) {
+-            auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(work_tile_info);
+-            work_tile_info = next_work_tile_info;
+-            continue;
++          if constexpr (!IsGroupedGemmKernel) {   // group scheduler tiles are valid for every warp group
++            if (!TileScheduler::valid_warpgroup_in_work_tile(work_tile_info)) {
++              auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(work_tile_info);
++              work_tile_info = next_work_tile_info;
++              continue;
++            }
+           }
+ 
+           // Compute m_coord, n_coord, l_coord with the post-tiled m-shape and n-shape
+@@ -716,6 +863,8 @@
+           work_tile_info = next_work_tile_info;
+           if constexpr (IsSchedDynamicPersistent) {
+             requires_clc_query = increment_pipe;
++          }
++          if constexpr (IsSchedDynamicPersistent || IsGroupedGemmKernel) {
+             if (increment_pipe) {
+               ++scheduler_pipe_consumer_state;
+             }
+@@ -768,7 +917,7 @@
+                                                                                 ,scheduler_pipe_consumer_state
+                                                                                );
+           work_tile_info = next_work_tile_info;
+-          if constexpr (IsSchedDynamicPersistent) {
++          if constexpr (IsSchedDynamicPersistent || IsGroupedGemmKernel) {
+             if (increment_pipe) {
+               ++scheduler_pipe_consumer_state;
+             }
+@@ -787,6 +936,17 @@
+ 
+       CollectiveEpilogue collective_epilogue(params.epilogue, shared_storage.tensors.epilogue);
+ 
++      // grouped-sparse-GEMM: an epilogue that owns a padding fill of its outputs (the fused SwiGLU
++      // + FP4 epilogue's SFB) writes it here, in every CTA, including CTAs without a tile. The
++      // fill reads the per-expert counts, so it waits for the grid it depends on first.
++      if constexpr (detail::HasPrologueFill<CollectiveEpilogue>::value) {
++        cutlass::arch::wait_on_dependent_grids();
++        uint32_t const cta = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
++        uint32_t const ctas = gridDim.x * gridDim.y * gridDim.z;
++        collective_epilogue.prologue_fill(int(cta * NumMMAThreads + mma_thread_idx),
++                                          int(ctas * NumMMAThreads));
++      }
++
+       // Do we potentially issue tail arrives for TMA stores, if epilogue load is waiting for it
+       bool do_store_tail = false;
+       while (work_tile_info.is_valid()) {
+@@ -880,7 +1040,7 @@
+                                                                               ,scheduler_pipe_consumer_state
+                                                                               );
+         work_tile_info = next_work_tile_info;
+-        if constexpr (IsSchedDynamicPersistent) {
++        if constexpr (IsSchedDynamicPersistent || IsGroupedGemmKernel) {
+           if (increment_pipe) {
+             ++scheduler_pipe_consumer_state;
+           }
+--- /dev/null
++++ b/include/cutlass/gemm/kernel/sm120_tile_scheduler_group_splitk.hpp
+@@ -0,0 +1,351 @@
++/***************************************************************************************************
++ * Copyright (C) 2026 Kwanhee Lee and Dan Alistarh. All Rights Reserved.
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
++ * in compliance with the License. You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ **************************************************************************************************/
++
++/*! \file
++    \brief Grouped (MoE) tile scheduler with split-K for the SM120 sparse GEMM (grouped-sparse-GEMM;
++           not part of CUTLASS).
++
++    Extends PersistentTileSchedulerSm90Group: every output tile of the group walk is cut into
++    `splits` K ranges. With splits == 1 it schedules exactly like the base scheduler.
++
++    Work units u = t * S + s (tile t in group-walk order, split s) are dealt to the G persistent
++    CTAs round-robin, u -> CTA u % G, with G a multiple of S. Hence the S splits of a tile run in
++    the same round on the S consecutive CTAs of one "slot" (t % (G / S)), and a slot always sees
++    split s on the same CTA. Each slot has S - 1 fp32 partial buffers and two counters:
++      - splits 0..S-2 store their accumulators into partial buffer s, then add 1 to `arrived`;
++      - split S - 1 waits until `arrived` reaches (round + 1) * (S - 1), adds the S - 1 partials
++        in split order (deterministic), sets `consumed` to round + 1 and runs the epilogue; the
++        other splits skip it;
++      - in the next round, splits 0..S-2 first wait for `consumed` >= round, so they never
++        overwrite a partial the previous round's reducer has not read yet.
++    The reduction is one step, not a chain: the partials are written concurrently.
++
++    Each thread stores and reloads only its own accumulator fragment, and every CTA has the same
++    thread-to-fragment mapping, so the buffers need no coordinate math. Only the counters need a
++    known start state; they are zeroed per launch by initialize_workspace (graph-safe), and the
++    partials are fully written before they are read.
++
++    The waits assume all G CTAs are co-resident (G <= SM count, one CTA per SM), as CUTLASS's
++    stream-K scheduler does.
++*/
++
++#pragma once
++
++#include "cutlass/arch/barrier.h"
++#include "cutlass/workspace.h"
++#include "cutlass/gemm/kernel/sm90_tile_scheduler_group.hpp"
++
++namespace cutlass::gemm::kernel::detail {
++
++template <class GroupProblemShape, int SchedulerPipelineStageCount, class TileShape>
++class PersistentTileSchedulerSm120GroupSplitK
++    : public PersistentTileSchedulerSm90Group<GroupProblemShape, SchedulerPipelineStageCount> {
++  using Base = PersistentTileSchedulerSm90Group<GroupProblemShape, SchedulerPipelineStageCount>;
++
++public:
++  static constexpr int TileM = int(cute::size<0>(TileShape{}));
++  static constexpr int TileN = int(cute::size<1>(TileShape{}));
++  static constexpr int TileK = int(cute::size<2>(TileShape{}));
++  static constexpr bool IsDynamicPersistent = false;
++
++  using typename Base::RasterOrder;
++  using typename Base::RasterOrderOptions;
++  using typename Base::Pipeline;
++  using typename Base::PipelineStorage;
++  using typename Base::PipelineState;
++  using typename Base::ThrottlePipeline;
++  using typename Base::ThrottlePipelineStorage;
++  using typename Base::SharedStorage;
++  using BaseParams = typename Base::Params;
++
++  struct WorkTileInfo {
++    int32_t M_idx = 0;
++    int32_t N_idx = 0;
++    int32_t L_idx = 0;
++    int32_t is_valid_tile = 0;
++    int32_t k_tile_start = 0;
++    int32_t k_tile_count = 0;
++    int32_t split = 0;
++    int32_t splits = 1;
++    int32_t slot = 0;
++    int32_t round = 0;
++
++    CUTLASS_HOST_DEVICE bool is_valid() const { return is_valid_tile != 0; }
++    CUTLASS_HOST_DEVICE static WorkTileInfo invalid_work_tile() { return {-1, -1, -1, 0}; }
++    CUTLASS_HOST_DEVICE bool is_final_split(uint32_t) const { return split == splits - 1; }
++    CUTLASS_HOST_DEVICE int32_t reduction_subtile_idx() const { return -1; }
++  };
++  using SchedulerResponse = WorkTileInfo;
++
++  struct Arguments : Base::Arguments {
++    int splits = 1;
++  };
++
++  struct Params : BaseParams {
++    int32_t splits = 1;
++    int32_t k_tiles = 1;
++    int32_t slots = 1;
++    int32_t* flags = nullptr;
++    float* partials = nullptr;
++  };
++
++  static constexpr size_t kFlagAlign = 128;
++
++  static int grid_ctas(int sm_count, int splits) {
++    return splits > 1 ? (sm_count / splits) * splits : sm_count;
++  }
++
++  // Two counters per slot (arrived, consumed).
++  static size_t flag_bytes(int slots) {
++    return (size_t(2 * slots) * sizeof(int32_t) + kFlagAlign - 1) / kFlagAlign * kFlagAlign;
++  }
++
++  static size_t partial_bytes(int slots, int splits) {
++    return size_t(slots) * size_t(splits - 1) * TileM * TileN * sizeof(float);
++  }
++
++  static int resolved_sm_count(KernelHardwareInfo const& hw_info) {
++    return hw_info.sm_count > 0 ? hw_info.sm_count
++                                : KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
++  }
++
++  template <class TileShape_, class ClusterShape>
++  static Params
++  to_underlying_arguments(GroupProblemShape problem_shapes, TileShape_ tile_shape, ClusterShape cluster_shape,
++                          KernelHardwareInfo const& hw_info, Arguments const& arguments,
++                          void* workspace = nullptr, const uint32_t epilogue_subtile = 1,
++                          uint32_t ktile_start_alignment_count = 1u) {
++    int splits = arguments.splits > 1 ? arguments.splits : 1;
++    KernelHardwareInfo hw = hw_info;
++    hw.sm_count = grid_ctas(resolved_sm_count(hw_info), splits);
++    Params params;
++    static_cast<BaseParams&>(params) = Base::to_underlying_arguments(
++        problem_shapes, tile_shape, cluster_shape, hw, arguments, workspace, epilogue_subtile,
++        ktile_start_alignment_count);
++    params.splits = splits;
++    params.k_tiles = int32_t((cute::get<2>(problem_shapes.get_host_problem_shape(0)) + TileK - 1) / TileK);
++    params.slots = hw.sm_count / splits;
++    if (splits > 1) {
++      params.flags = reinterpret_cast<int32_t*>(workspace);
++      params.partials = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(workspace) + flag_bytes(params.slots));
++    }
++    return params;
++  }
++
++  template <class TileShape_, class ClusterShape>
++  CUTLASS_HOST_DEVICE static dim3
++  get_grid_shape(Params const& params, GroupProblemShape const& problem_shapes, TileShape_ tile_shape,
++                 ClusterShape cluster_shape, KernelHardwareInfo hw_info, Arguments arguments,
++                 bool truncate_by_problem_size = true) {
++    hw_info.sm_count = params.slots * params.splits;
++    return Base::get_grid_shape(params, problem_shapes, tile_shape, cluster_shape, hw_info, arguments,
++                                truncate_by_problem_size);
++  }
++
++  static bool
++  can_implement(Arguments const& args, KernelHardwareInfo const&) {
++    return args.splits >= 1;
++  }
++
++  template <class ProblemShape, class ElementAccumulator>
++  static size_t
++  get_workspace_size(Arguments const& args, ProblemShape, KernelHardwareInfo const& hw_info,
++                     uint32_t, const uint32_t = 1, uint32_t = 1) {
++    if (args.splits <= 1) {
++      return 0;
++    }
++    int slots = grid_ctas(resolved_sm_count(hw_info), args.splits) / args.splits;
++    return flag_bytes(slots) + partial_bytes(slots, args.splits);
++  }
++
++  template <class ProblemShape, class ElementAccumulator>
++  static cutlass::Status
++  initialize_workspace(Arguments const& args, void* workspace, cudaStream_t stream, ProblemShape,
++                       KernelHardwareInfo const& hw_info, uint32_t, const uint32_t = 1, uint32_t = 1,
++                       CudaHostAdapter* cuda_adapter = nullptr) {
++    if (args.splits <= 1) {
++      return Status::kSuccess;
++    }
++    int slots = grid_ctas(resolved_sm_count(hw_info), args.splits) / args.splits;
++    return zero_workspace(workspace, flag_bytes(slots), stream, cuda_adapter);
++  }
++
++  PersistentTileSchedulerSm120GroupSplitK() = default;
++
++  CUTLASS_DEVICE explicit
++  PersistentTileSchedulerSm120GroupSplitK(Params const& params, SchedulerResponse* response_ptr)
++      : Base(params, reinterpret_cast<typename Base::SchedulerResponse*>(response_ptr)),
++        splits_(params.splits), k_tiles_(params.k_tiles), slots_(params.slots) {}
++
++  // Warp-collective (the base group walk shuffles across the warp).
++  CUTLASS_DEVICE WorkTileInfo
++  work_for_unit(uint64_t unit) {
++    uint64_t tile = splits_ > 1 ? unit / uint64_t(splits_) : unit;
++    int32_t split = splits_ > 1 ? int32_t(unit - tile * uint64_t(splits_)) : 0;
++    auto base = this->get_current_work_for_linear_idx(tile);
++    if (!base.is_valid()) {
++      return WorkTileInfo::invalid_work_tile();
++    }
++    WorkTileInfo w;
++    w.M_idx = base.M_idx;
++    w.N_idx = base.N_idx;
++    w.L_idx = base.L_idx;
++    w.is_valid_tile = 1;
++    w.k_tile_start = int32_t((int64_t(split) * k_tiles_) / splits_);
++    w.k_tile_count = int32_t((int64_t(split + 1) * k_tiles_) / splits_) - w.k_tile_start;
++    w.split = split;
++    w.splits = splits_;
++    w.slot = int32_t(tile % uint64_t(slots_));
++    w.round = int32_t(tile / uint64_t(slots_));
++    return w;
++  }
++
++  template <class ClusterShape, typename CallbackBeforeCommit = WorkTileInfo(*)(WorkTileInfo)>
++  CUTLASS_DEVICE WorkTileInfo
++  initial_work_tile_info(ClusterShape, CallbackBeforeCommit = [] (WorkTileInfo r) { return r; }) {
++    return work_for_unit(this->current_work_linear_idx_);
++  }
++
++  template <typename TileSchedulerPipeline, typename TileSchedulerPipelineState,
++            typename CallbackBeforeCommit = WorkTileInfo(*)(WorkTileInfo)>
++  CUTLASS_DEVICE auto
++  advance_to_next_work(TileSchedulerPipeline& scheduler_pipeline,
++                       TileSchedulerPipelineState scheduler_pipe_producer_state,
++                       uint32_t advance_count = 1,
++                       CallbackBeforeCommit = [] (WorkTileInfo r) { return r; }) {
++    this->current_work_linear_idx_ += this->total_grid_size_ * uint64_t(advance_count);
++    WorkTileInfo work_tile = work_for_unit(this->current_work_linear_idx_);
++    scheduler_pipeline.producer_acquire(scheduler_pipe_producer_state);
++    if (cute::elect_one_sync()) {
++      reinterpret_cast<WorkTileInfo*>(this->response_ptr_)[scheduler_pipe_producer_state.index()] = work_tile;
++      cutlass::arch::fence_view_async_shared();
++      scheduler_pipeline.producer_commit(scheduler_pipe_producer_state);
++    }
++    return cute::make_tuple(work_tile, true);
++  }
++
++  template <typename TileSchedulerPipeline, typename TileSchedulerPipelineState>
++  CUTLASS_DEVICE auto
++  fetch_next_work(WorkTileInfo, TileSchedulerPipeline& scheduler_pipeline,
++                  TileSchedulerPipelineState scheduler_pipe_consumer_state) {
++    scheduler_pipeline.consumer_wait(scheduler_pipe_consumer_state);
++    WorkTileInfo work_tile = reinterpret_cast<WorkTileInfo*>(this->response_ptr_)[scheduler_pipe_consumer_state.index()];
++    cutlass::arch::fence_view_async_shared();
++    scheduler_pipeline.consumer_release(scheduler_pipe_consumer_state);
++    return cute::make_tuple(work_tile, true);
++  }
++
++  template <class ProblemShape_MNKL, class TileShape_>
++  CUTLASS_HOST_DEVICE static int
++  get_work_k_tile_count(WorkTileInfo const& work_tile_info, ProblemShape_MNKL, TileShape_) {
++    return work_tile_info.k_tile_count;
++  }
++
++  CUTLASS_HOST_DEVICE static uint32_t
++  get_work_k_tile_start(WorkTileInfo const& work_tile_info) {
++    return uint32_t(work_tile_info.k_tile_start);
++  }
++
++  CUTLASS_HOST_DEVICE static bool
++  compute_epilogue(WorkTileInfo const& work_tile_info, Params const&) {
++    return work_tile_info.split == work_tile_info.splits - 1;
++  }
++
++  CUTLASS_DEVICE static bool
++  valid_warpgroup_in_work_tile(WorkTileInfo const&) {
++    return true;
++  }
++
++  CUTLASS_DEVICE static bool
++  requires_separate_reduction(Params const&) {
++    return false;
++  }
++
++  // One-step split-K reduction through the slot's partial buffers (see the file comment). Called
++  // by every MMA thread (num_barriers warp groups) after the mainloop of a work unit.
++  template <class FrgTensorC>
++  CUTLASS_DEVICE static void
++  fixup(Params const& params, WorkTileInfo const& work, FrgTensorC& accumulators,
++        uint32_t num_barriers, uint32_t /*barrier_idx*/) {
++    if (work.splits <= 1) {
++      return;
++    }
++    constexpr int FragSize = int(decltype(cute::size(cute::declval<FrgTensorC&>()))::value);
++    static_assert(FragSize % 4 == 0, "accumulator fragment must be a multiple of 4 floats");
++    static_assert(cute::is_same_v<typename FrgTensorC::value_type, float>, "split-K reduces fp32 accumulators");
++    const int num_threads = int(num_barriers) * NumThreadsPerWarpGroup;
++    const int tid = int(threadIdx.x) % num_threads;
++    int32_t* arrived  = params.flags + 2 * work.slot;
++    int32_t* consumed = arrived + 1;
++    constexpr size_t kTileFloats = size_t(TileM) * TileN;
++    float4* partials = reinterpret_cast<float4*>(
++        params.partials + size_t(work.slot) * size_t(work.splits - 1) * kTileFloats);
++    cutlass::arch::NamedBarrier barrier(num_threads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier0);
++
++    auto wait_at_least = [](int32_t* counter, int32_t value) {
++      int32_t seen;
++      while (true) {
++        asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(seen) : "l"(counter) : "memory");
++        if (seen >= value) break;
++        __nanosleep(20);
++      }
++    };
++
++    if (work.split < work.splits - 1) {
++      if (work.round > 0) {
++        if (tid == 0) wait_at_least(consumed, work.round);
++        barrier.sync();
++      }
++      float4* mine = partials + size_t(work.split) * (kTileFloats / 4);
++      CUTLASS_PRAGMA_UNROLL
++      for (int j = 0; j < FragSize / 4; ++j) {
++        __stcg(mine + size_t(j) * num_threads + tid,
++               make_float4(accumulators(4 * j + 0), accumulators(4 * j + 1),
++                           accumulators(4 * j + 2), accumulators(4 * j + 3)));
++      }
++      __threadfence();
++      barrier.sync();
++      if (tid == 0) {
++        asm volatile("red.release.gpu.global.add.s32 [%0], 1;" :: "l"(arrived) : "memory");
++      }
++    }
++    else {
++      if (tid == 0) wait_at_least(arrived, (work.round + 1) * (work.splits - 1));
++      barrier.sync();
++      for (int p = 0; p < work.splits - 1; ++p) {
++        float4 const* theirs = partials + size_t(p) * (kTileFloats / 4);
++        CUTLASS_PRAGMA_UNROLL
++        for (int j = 0; j < FragSize / 4; ++j) {
++          float4 v = __ldcg(theirs + size_t(j) * num_threads + tid);
++          accumulators(4 * j + 0) += v.x;
++          accumulators(4 * j + 1) += v.y;
++          accumulators(4 * j + 2) += v.z;
++          accumulators(4 * j + 3) += v.w;
++        }
++      }
++      barrier.sync();
++      if (tid == 0) {
++        asm volatile("st.release.gpu.global.b32 [%0], %1;" :: "l"(consumed), "r"(work.round + 1) : "memory");
++      }
++    }
++  }
++
++private:
++  int32_t splits_ = 1;
++  int32_t k_tiles_ = 1;
++  int32_t slots_ = 1;
++};
++
++} // namespace cutlass::gemm::kernel::detail

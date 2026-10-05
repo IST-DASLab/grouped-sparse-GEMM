@@ -1,0 +1,10 @@
+# Metadata and the extension build live in setup.py. torch is deliberately not listed in
+# build-system.requires: an isolated build env would install a different torch than the one the
+# extension must link against. Build with `pip wheel . --no-deps --no-build-isolation -w dist`.
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
