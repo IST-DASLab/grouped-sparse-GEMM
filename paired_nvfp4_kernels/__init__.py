@@ -43,7 +43,7 @@ import importlib.util
 
 import torch
 
-__version__ = "0.13.0"
+__version__ = "0.14.0"
 
 __all__ = [
     "DEFAULT_TACTIC",
