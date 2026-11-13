@@ -35,7 +35,10 @@ CSRC = os.path.join(HERE, "csrc")
 VERSION = "0.13.0"
 
 # Archs with a csrc/sm<N>/ configuration. Extend when porting (see docs/porting.md).
-SUPPORTED_ARCHS = {"100a": 100, "120a": 120}
+# SM103 (B300) runs the SM100 configuration: same tcgen05 sparse MMA, csrc/sm100 sources.
+SUPPORTED_ARCHS = {"100a": 100, "103a": 103, "120a": 120}
+# Arch whose csrc/sm<N>/ sources an SM builds from.
+SOURCE_SM = {103: 100}
 
 cutlass_dir = os.environ.get("CUTLASS_DIR", os.path.join(HERE, "third_party", "cutlass"))
 cutlass_dir = os.path.abspath(cutlass_dir)
@@ -64,7 +67,7 @@ include_dirs = [
 
 
 def arch_sources(sm):
-    arch_dir = os.path.join(CSRC, f"sm{sm}")
+    arch_dir = os.path.join(CSRC, f"sm{SOURCE_SM.get(sm, sm)}")
     srcs = [os.path.join(CSRC, "ops.cu")]
     srcs += sorted(os.path.join(arch_dir, f) for f in os.listdir(arch_dir) if f.endswith(".cu"))
     if build_tests:
@@ -75,7 +78,7 @@ def arch_sources(sm):
 def extension(arch):
     sm = SUPPORTED_ARCHS[arch]
     defines = [f"-DPAIRED_NVFP4_SM={sm}"]
-    if sm == 100:
+    if sm in (100, 103):
         # Grid dependency control in the CUTLASS GEMMs, for programmatic dependent launch
         # (csrc/pdl.cuh). The SM100 kernel override waits before its first dependent read.
         defines.append("-DCUTLASS_ENABLE_GDC_FOR_SM100=1")

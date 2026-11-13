@@ -59,7 +59,7 @@ __all__ = [
 ]
 
 # SM number -> extension module, in the order setup.py may build them.
-_ARCH_MODULES = {100: "_C_sm100", 120: "_C_sm120"}
+_ARCH_MODULES = {100: "_C_sm100", 103: "_C_sm103", 120: "_C_sm120"}
 
 
 def _current_sm():
@@ -115,8 +115,9 @@ def is_available():
 # Per arch: the default tactic (also the op schema defaults) and the legal cluster dims.
 #   SM100: dynamic clusters, each dim 1, 2 or 4 (2SM kernels pair CTAs along M).
 #   SM120: no cluster multicast on this arch, so the cluster is always 1x1.
-_DEFAULT_TACTICS = {100: (0, 2, 1), 120: (2, 1, 1)}
-_CLUSTER_DIMS = {100: (1, 2, 4), 120: (1,)}
+#   SM103: the SM100 configuration.
+_DEFAULT_TACTICS = {100: (0, 2, 1), 103: (0, 2, 1), 120: (2, 1, 1)}
+_CLUSTER_DIMS = {100: (1, 2, 4), 103: (1, 2, 4), 120: (1,)}
 
 DEFAULT_TACTIC = _DEFAULT_TACTICS[_LOADED_SM]
 

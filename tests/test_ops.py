@@ -300,6 +300,7 @@ def test_group_mm_rejects_bad_cluster():
     M, max_n, K, E = 256, 128, 256, 2
     o = make_operands(M, max_n, K, E, seed=0)
     # SM100: config 0 is a 2SM kernel and needs an even cluster_m. SM120: only 1x1 clusters.
-    bad, msg = {100: ((0, 1, 1), "even cluster_m"), 120: ((0, 2, 1), "1x1 cluster")}[pnk.loaded_arch()]
+    bad, msg = {100: ((0, 1, 1), "even cluster_m"), 103: ((0, 1, 1), "even cluster_m"),
+                120: ((0, 2, 1), "1x1 cluster")}[pnk.loaded_arch()]
     with pytest.raises(RuntimeError, match=msg):
         run_group_mm(o, M, max_n, K, E, tactic=bad)

@@ -85,7 +85,9 @@ namespace paired_nvfp4 {
 
 using namespace cute;
 
-static constexpr int kArchSm = 100;
+// SM100 or SM103 (B300 builds these sources with -DPAIRED_NVFP4_SM=103).
+static constexpr int kArchSm = PAIRED_NVFP4_SM;
+static_assert(kArchSm == 100 || kArchSm == 103, "sm100/config.cuh serves SM100 and SM103");
 
 using ElementA     = cutlass::float_e2m1_t;
 using ElementAPair = cutlass::nv_float4_t<ElementA>;

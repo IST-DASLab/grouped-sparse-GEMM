@@ -22,7 +22,7 @@
 #error "PAIRED_NVFP4_SM must be defined (setup.py passes it per extension module)"
 #endif
 
-#if PAIRED_NVFP4_SM == 100
+#if PAIRED_NVFP4_SM == 100 || PAIRED_NVFP4_SM == 103
 #include "sm100/config.cuh"
 #elif PAIRED_NVFP4_SM == 120
 #include "sm120/config.cuh"
